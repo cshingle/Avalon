@@ -30,8 +30,9 @@ server-repro.sh).
 ## 2026-11-07: differential fingerprints of the short request (plan Phase 2, rows 1/3/4)
 
 Procedure each: fresh server (cold cache), 23k-token request, 5 s idle, ~600-token
-unrelated request. Sampler 200 ms on the 6900 XT. Files: `gfx1030-repro/run{8,9,10}.csv`,
-logs `run{8,9,10}-*.log`.
+unrelated request. Sampler 200 ms on the 6900 XT. Captures `gfx1030-repro/run{8..14}.csv`
+(only run8.csv and run13.csv are committed to the branch; the rest are working captures,
+their numbers are fully in the tables below).
 
 | config | ttft | trajectory during the short request |
 |---|---|---|

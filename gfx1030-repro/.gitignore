@@ -3,3 +3,4 @@
 *.stdout
 *.out
 __pycache__/
+run*.csv
