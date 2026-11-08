@@ -1,0 +1,5 @@
+# server/sampler working files and captures, not for git
+*.log
+*.stdout
+*.out
+__pycache__/

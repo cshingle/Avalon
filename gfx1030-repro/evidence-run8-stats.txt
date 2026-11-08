@@ -1,0 +1,10 @@
+0.13.647.104 I moe hosted: 9 experts moved to the GPU
+0.13.647.109 I moe hosted: 8 layers: GPU between layers 1328.8 us, plan 25.5 us, CPU rows 2645.5 us (12.62 rows)
+0.13.662.085 I moe hosted: 17 experts moved to the GPU
+0.13.662.092 I moe hosted: 16 layers: GPU between layers 1327.5 us, plan 20.1 us, CPU rows 1588.2 us (12.19 rows)
+0.13.733.551 I ggml_backend_sched_find_hosted_moe: hosting a MoE block beats its prefetch up to 49585 - 49585 routed rows (4900 + 3.44 us per row against the copy), hosted up to 8191
+0.02.580.167 I [moe-cache] configured: mode=auto devices=1 budget=free-minus-reserve reserve=1024 MiB min-slab=1024 MiB min-expert=512 KiB max-batch=10 inserts=8 admit=1-complete/3-partial/8-replace cpu-overlap=auto fills=serial expert-parallel=0 down-mmv=generic
+0.02.580.240 I [moe-cache] CUDA0 capacity: policy=free-minus-reserve granted=6630 MiB free=7654 MiB reserve=1024 MiB
+0.11.855.807 I [moe-cache] CUDA0 banded slab: 51 bands of 128 MiB (6528 MiB), 849 KiB unused (0.01 %)
+3.17.396.566 I moe hosted: 7273 experts moved to the GPU
+3.17.396.572 I moe hosted: 2520 layers: GPU between layers 701.2 us, plan 1105.1 us, CPU rows 2798.1 us (96.47 rows)
