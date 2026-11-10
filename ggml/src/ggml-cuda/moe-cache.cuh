@@ -56,6 +56,11 @@ void ggml_cuda_moe_split_graph_launch(int device, const void * owner);
 // a hosted MoE block exists (its kernels may wait for the host)
 bool ggml_cuda_moe_hosted_active();   // cudaStream_t, cudaEvent_t, the stream's device
 
+// DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_WATCHDOG=s > 0): a caller-side phase point for the hang watchdog,
+// and the compute stream for its GPU liveness probe (the physical device, the stream to probe)
+void ggml_cuda_moe_wd_phase(int phase);
+void ggml_cuda_moe_wd_set_probe_stream(void * stream, int device);
+
 // Prefill: the table of expert addresses of a prefetched MUL_MAT_ID weight (one per expert: its entry in the cache,
 // or its place in the prefetch slot), registered by the scheduler for the duration of its split; nullptr otherwise.
 // MMQ then reads each expert at its address (ggml_cuda_mul_mat_q).

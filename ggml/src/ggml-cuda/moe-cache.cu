@@ -93,6 +93,7 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #include <mutex>
 #include <new>
 #include <set>
+#include <sstream>
 #include <string>
 #include <functional>
 #include <thread>
@@ -113,6 +114,7 @@ static inline bool ggml_type_is_exl3(ggml_type) { return false; }
 #    include <d3dkmthk.h>   // D3DKMTQueryStatistics: the VRAM resident for every process
 #  endif
 #elif defined(__linux__)
+#  include <dirent.h>
 #  include <fcntl.h>
 #  include <sched.h>
 #  include <sys/file.h>
@@ -7629,6 +7631,8 @@ struct moe_hosted_state {
     unsigned * d_q8_count = nullptr;   // the up / gate kernel's warps done per q8_1 block of d_q8_mid (zero between launches)
     unsigned * d_router_done = nullptr;   // the router's rows done (k_moe_hosted_enter), zero between layers
     uint64_t * d_router_tagged = nullptr; // the router's rows, {layer tag, logit} (k_moe_hosted_enter)
+    // clock keeper: ALU work across the poll window, the merge's trailing workgroups (GGML_CUDA_MOE_CLOCK_KEEP=1)
+    float * d_keep_sink = nullptr;
     size_t q8_act_bytes = 0;
     size_t q8_mid_bytes = 0;
     int n_threads = 1;
@@ -7703,6 +7707,8 @@ struct moe_hosted_pending {
     uint32_t * diag = nullptr;
     int n_used = 0;
     bool psum = false;    // EXPERT SPLIT, PSUM: each card's rows of a token come as one weighted sum
+    float * d_keep_sink = nullptr;   // clock keeper: the merge's trailing workgroups (GGML_CUDA_MOE_CLOCK_KEEP=1)
+    int n_keep = 0;
 };
 static thread_local moe_hosted_pending g_hosted_pending;
 
@@ -8556,14 +8562,42 @@ static __global__ void k_split_card_psum(const uint64_t * d_plan, const uint64_t
     }
 }
 
+// clock keeper (GGML_CUDA_MOE_CLOCK_KEEP=1): the wait CTAs sleep, the CUs idle, the clock drops to the
+// idle floor, and when the CPU rows land every CTA turns to compute at once - the card steps from the
+// low-voltage floor to full boost inside a second (issue 27, gfx1030). The keeper is the merge's
+// trailing workgroups (k_moe_hosted_merge): a separate stream for it added a HW queue that oversubscribed
+// the runlist, and a stream then stopped draining while the host waited on it
+#define MOE_CLOCK_KEEP_CTAS 64
+#define MOE_CLOCK_KEEP_CAP_NS 500000000ULL
+
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
                                           volatile uint32_t * d_rows_ready, const uint64_t * d_down_ids, const uint64_t * d_moved_down_ids,
                                           const volatile float * m_res, float * dst, int n_embd,
                                           volatile unsigned long long * tl, const moe_sgate_args sg,
                                           const volatile int8_t * m_src, const volatile uint32_t * flags,
-                                          volatile uint32_t * diag, int n_used, int psum) {
-    if (sg.x && blockIdx.x == gridDim.x - 1) {
-        moe_sgate_body(sg);   // the last workgroup: the shared expert's gate
+                                          volatile uint32_t * diag, int n_used, int psum,
+                                          float * keep_sink, int n_keep) {
+    if (n_keep > 0 && blockIdx.x >= (int) gridDim.x - n_keep) {
+        // clock keeper (GGML_CUDA_MOE_CLOCK_KEEP=1): hold ALU work across the rows' poll window, on the
+        // relay's VRAM word (many readers are safe there; the host line is not), capped on the GPU clock
+        const uint32_t expect = *d_expect;
+        float a = 0.5f + threadIdx.x * 0.001f, b = 1.0f;
+        const unsigned long long t0 = moe_tl_clock();
+        for (;;) {
+#pragma unroll
+            for (int i = 0; i < 1024; i++) {
+                a = fmaf(a, b, 0.25f);
+                b = fmaf(b, a, -0.125f);
+            }
+            if ((int32_t) (*d_rows_ready - expect) >= 0 || moe_tl_clock() - t0 >= MOE_CLOCK_KEEP_CAP_NS) {
+                break;
+            }
+        }
+        keep_sink[(blockIdx.x - (int) gridDim.x + n_keep) * blockDim.x + threadIdx.x] = a + b;
+        return;
+    }
+    if (sg.x && blockIdx.x == (int) gridDim.x - 1 - n_keep) {
+        moe_sgate_body(sg);   // the shared expert's gate
         return;
     }
     if (blockIdx.x == 0 && threadIdx.x == 0) {
@@ -10266,6 +10300,298 @@ static void moe_hosted_server_loop() {
     }
 }
 
+// DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_WATCHDOG=s > 0): a detached thread that, every 5 s while a wait for the
+// stream is in progress, prints where the host and the GPU are: the per-state host view (the mailbox, the plan
+// and rows flags, the keeper), the GPU timeline of the last publications (the ring needs GGML_CUDA_MOE_TIMELINE=1),
+// and the process threads (state, ticks). The escape loop's heartbeat (g_wd_hb) and phase (g_wd_phase) say
+// whether the waiting thread is still in the loop, and where
+static std::atomic<int64_t> g_wd_hb{0};
+static std::atomic<int>     g_wd_phase{-1};
+static std::atomic<int64_t> g_wd_phase_ns{0};
+
+static const char * moe_wd_phase_name(int p) {
+    switch (p) {
+        case -1: return "no wait in progress";
+        case 10: return "entered the wait";
+        case 11: return "in the loop (query / serve check)";
+        case 13: return "serving a mailbox";
+        case 20: return "graph_compute";
+        case 21: return "before cudaGraphLaunch";
+        case 22: return "after cudaGraphLaunch";
+        case 23: return "before cudaEventRecord";
+        case 24: return "after cudaEventRecord";
+        case 25: return "event sync: the moe wait";
+        case 26: return "event sync: cudaEventSynchronize";
+        case 27: return "a buffer op (stream sync)";
+        case 28: return "prime queues";
+        case 30: return "before the D2H memcpy (per-thread stream)";
+        case 31: return "per-thread stream sync (D2H)";
+        case 99: return "the wait returned";
+        default: return "?";
+    }
+}
+
+static void moe_wd_phase(int p) {
+    if (g_wd_phase.load(std::memory_order_relaxed) == p) {
+        return;
+    }
+    g_wd_phase_ns.store(moe_tl_now_ns(), std::memory_order_relaxed);
+    g_wd_phase.store(p, std::memory_order_relaxed);
+}
+
+// the GPU timeline of one publication: 0 = the phase did not happen, else its offset from the publication in us
+// (the ring's entries are one GPU clock apart): plan seen = the enter's plan wait passed, mstart = a merge block
+// reached its rows wait, mend = the merge's rows wait passed
+static void moe_wd_ring(char * out, size_t n, uint32_t seq) {
+    const unsigned long long * tl = g_tl_h + (seq % MOE_TL_RING) * 8;
+    const unsigned long long pub = tl[0];
+    char e1[32] = "0", e2[32] = "0", e3[32] = "0";
+    if (pub) {
+        const unsigned long long v[3] = {tl[1], tl[4], tl[2]};
+        char * b[3] = {e1, e2, e3};
+        for (int i = 0; i < 3; i++) {
+            if (!v[i]) {
+                continue;
+            }
+            if (v[i] >= pub) {
+                snprintf(b[i], 32, "+%.1fus", (double) (v[i] - pub) / 1e3);
+            } else {
+                snprintf(b[i], 32, "stale");
+            }
+        }
+    }
+    snprintf(out, n, "[moe-cache] WATCHDOG:   tl[%u]: pub %llu, plan %s, mstart %s, mend %s",
+             seq % MOE_TL_RING, (unsigned long long) pub, e1, e2, e3);
+}
+
+// the host's own times for one publication (a different clock: only offsets from the publication seen mean)
+static void moe_wd_host_ring(char * out, size_t n, moe_hosted_state * s, uint32_t seq) {
+    const int64_t * h = s->tl_host.data() + (seq % MOE_TL_RING) * 3;
+    char e1[32] = "0", e2[32] = "0";
+    if (h[0]) {
+        if (h[1] && h[1] >= h[0]) {
+            snprintf(e1, sizeof(e1), "+%.1fus", (double) (h[1] - h[0]) / 1e3);
+        }
+        if (h[2] && h[2] >= h[0]) {
+            snprintf(e2, sizeof(e2), "+%.1fus", (double) (h[2] - h[0]) / 1e3);
+        }
+    }
+    snprintf(out, n, "[moe-cache] WATCHDOG:   host[%u]: pub %s, plan %s, rows %s",
+             seq % MOE_TL_RING, h[0] ? "set" : "0", e1, e2);
+}
+
+#if defined(__linux__)
+// the process threads: "tid:state" each, and for the running ones their ticks (the delta between prints
+// shows who spins)
+static void moe_wd_threads(std::string & all, std::map<int, int64_t> & last, std::string & rline) {
+    std::map<int, int64_t> cur;
+    all.clear();
+    DIR * d = opendir("/proc/self/task");
+    if (!d) {
+        all = "?";
+        return;
+    }
+    struct dirent * e;
+    while ((e = readdir(d)) != nullptr) {
+        if (e->d_name[0] < '0' || e->d_name[0] > '9') {
+            continue;
+        }
+        const std::string path = std::string("/proc/self/task/") + e->d_name + "/stat";
+        FILE * f = fopen(path.c_str(), "r");
+        if (!f) {
+            continue;   // the thread exited between the readdir and the open
+        }
+        char buf[480];
+        if (!fgets(buf, sizeof(buf), f)) {
+            fclose(f);
+            continue;
+        }
+        fclose(f);
+        const char * cp = strrchr(buf, ')');
+        if (!cp) {
+            continue;
+        }
+        std::istringstream is(cp + 2);
+        char state = 0;
+        int64_t v[32] = {};
+        is >> state;
+        for (int i = 0; i < 32; i++) {
+            is >> v[i];
+        }
+        all += (all.empty() ? "" : " ");
+        all += e->d_name;
+        char s[2] = {state, 0};
+        all += (state == 'R' ? ":R" : state == 'S' ? ":S" : state == 'D' ? ":D" : s);
+        if (state == 'R') {
+            cur[atoi(e->d_name)] = v[10] + v[11];
+        }
+    }
+    closedir(d);
+    rline.clear();
+    for (const auto & x : cur) {
+        const int64_t delta = last.count(x.first) ? x.second - last[x.first] : -1;
+        char t[80];
+        if (delta >= 0) {
+            snprintf(t, sizeof(t), "%s%d (+%lld ticks)", rline.empty() ? "" : " ", x.first, (long long) delta);
+        } else {
+            snprintf(t, sizeof(t), "%s%d (new)", rline.empty() ? "" : " ", x.first);
+        }
+        rline += t;
+    }
+    last.swap(cur);
+}
+#endif // __linux__
+
+// the GPU liveness probe: a 1-CTA kernel on a stream writes its wall clock to mapped host memory.
+// The probe says whether work queued on the stream still runs: a stale tick (or a launch that never
+// returns, this thread prints nothing after the previous line) means the stream or the card is wedged
+static std::atomic<void *> g_wd_probe_stream{nullptr};
+static std::atomic<int>    g_wd_probe_device{-1};
+
+static __global__ void k_wd_probe(unsigned long long * ts) {
+    *ts = moe_tl_clock();
+}
+
+static void moe_wd_probe_once(void * stream, unsigned long long * h, unsigned long long * m, const char * name) {
+    const int64_t t0 = moe_tl_now_ns();
+    k_wd_probe<<<1, 1, 0, (cudaStream_t) stream>>>(m);
+    const cudaError_t le = cudaGetLastError();
+    if (le != cudaSuccess) {
+        GGML_LOG_ERROR("[moe-cache] WATCHDOG: probe %s: launch error\n", name);
+        return;
+    }
+    cudaEvent_t ev = nullptr;
+    if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
+        (void) cudaGetLastError();
+        GGML_LOG_ERROR("[moe-cache] WATCHDOG: probe %s: event create failed\n", name);
+        return;
+    }
+    cudaEventRecord(ev, (cudaStream_t) stream);
+    int done = 0;
+    for (int i = 0; i < 200; i++) {
+        if (cudaEventQuery(ev) != cudaErrorNotReady) {
+            done = 1;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    cudaEventDestroy(ev);
+    GGML_LOG_ERROR("[moe-cache] WATCHDOG: probe %s: launch %lld us, kernel %s, tick %llu\n",
+                   name, (long long) ((moe_tl_now_ns() - t0) / 1000), done ? "done" : "NOT done in 2 s",
+                   (unsigned long long) h[0]);
+}
+
+static void moe_wd_probe_loop() {
+    unsigned long long * h = nullptr;
+    unsigned long long * m = nullptr;
+    for (;;) {
+        std::this_thread::sleep_for(std::chrono::seconds(5));
+        const int dev = g_wd_probe_device.load(std::memory_order_acquire);
+        void * s1 = g_wd_probe_stream.load(std::memory_order_acquire);
+        if (dev < 0 || !s1) {
+            continue;
+        }
+        if (!h) {
+            if (cudaSetDevice(dev) != cudaSuccess ||
+                cudaHostAlloc(&h, 2 * sizeof(unsigned long long), cudaHostAllocMapped) != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_ERROR("[moe-cache] WATCHDOG: probe: mapped alloc failed\n");
+                return;
+            }
+            h[0] = 0;
+            h[1] = 0;
+            if (cudaHostGetDevicePointer((void **) &m, h, 0) != cudaSuccess) {
+                (void) cudaGetLastError();
+                GGML_LOG_ERROR("[moe-cache] WATCHDOG: probe: device pointer failed\n");
+                return;
+            }
+            GGML_LOG_ERROR("[moe-cache] WATCHDOG: probe thread started (compute, this thread's per-thread stream)\n");
+        }
+        cudaSetDevice(dev);
+        moe_wd_probe_once(s1, h, m, "compute");
+        moe_wd_probe_once(nullptr, h + 1, m + 1, "per-thread");
+    }
+}
+
+void ggml_cuda_moe_wd_phase(int p) {
+    moe_wd_phase(p);
+}
+
+void ggml_cuda_moe_wd_set_probe_stream(void * stream, int device) {
+    g_wd_probe_stream.store(stream, std::memory_order_release);
+    g_wd_probe_device.store(device, std::memory_order_release);
+}
+
+static void moe_hosted_watchdog_loop() {
+    int64_t hb_last = g_wd_hb.load(std::memory_order_relaxed);
+#if defined(__linux__)
+    std::map<int, int64_t> last;
+    std::string rline, all;
+#endif
+    for (;;) {
+        for (int i = 0; i < 50; i++) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        const int phase = g_wd_phase.load(std::memory_order_relaxed);
+        if (phase < 0) {
+            continue;   // nothing started yet
+        }
+        const int64_t now = moe_tl_now_ns();
+        const int64_t phase_age_ms = (now - g_wd_phase_ns.load(std::memory_order_relaxed)) / 1000000;
+        const int64_t hb = g_wd_hb.load(std::memory_order_relaxed);
+        const int64_t hb_delta = hb - hb_last;
+        hb_last = hb;
+        char main_line[160];
+        snprintf(main_line, sizeof(main_line), "[moe-cache] WATCHDOG: main: %s, phase %lld ms, loop +%.1f M iters / 5 s",
+                 moe_wd_phase_name(phase), (long long) phase_age_ms, (double) hb_delta / 1e6);
+#if defined(__linux__)
+        moe_wd_threads(all, last, rline);
+        GGML_LOG_ERROR("%s; running:%s; threads: %s\n", main_line, rline.empty() ? " (none)" : rline.c_str(), all.c_str());
+#else
+        GGML_LOG_ERROR("%s\n", main_line);
+#endif
+        std::lock_guard<std::mutex> lock(g_hosted_mu);
+        for (const auto & entry : g_hosted) {
+            moe_hosted_state * s = entry.second.get();
+            if (!s) {
+                continue;
+            }
+            const uint32_t seq = __atomic_load_n(&s->h_mail->seq, __ATOMIC_RELAXED);
+            const uint32_t slot = __atomic_load_n(&s->h_mail->slot, __ATOMIC_RELAXED);
+            const uint32_t ntok = __atomic_load_n(&s->h_mail->n_tokens, __ATOMIC_RELAXED);
+            const uint32_t last_seq = s->last_seq;
+            uint32_t pflag = 0, rflag = 0;
+            {
+                std::lock_guard<std::mutex> lock_s(s->mu);
+                if (slot < s->layers.size() && s->layers[slot]) {
+                    pflag = __atomic_load_n(&s->layers[slot]->h_flags[0], __ATOMIC_RELAXED);
+                    rflag = __atomic_load_n(&s->layers[slot]->h_flags[16], __ATOMIC_RELAXED);
+                }
+            }
+            char line[256];
+            snprintf(line, sizeof(line),
+                     "[moe-cache] WATCHDOG: state: mail seq %u (slot %u, %u tok), served %u, plan flag %u, rows flag %u, pending %u",
+                     seq, slot, ntok, last_seq, pflag, rflag, s->server_pending);
+            GGML_LOG_ERROR("%s\n", line);
+            if (g_tl_h) {
+                char g[256];
+                moe_wd_ring(g, sizeof(g), seq);
+                GGML_LOG_ERROR("%s\n", g);
+                const unsigned long long next_pub = g_tl_h[((seq + 1) % MOE_TL_RING) * 8 + 0];
+                if (g_tl_h[(seq % MOE_TL_RING) * 8 + 0] && next_pub > g_tl_h[(seq % MOE_TL_RING) * 8 + 0]) {
+                    moe_wd_ring(g, sizeof(g), seq + 1);
+                    GGML_LOG_ERROR("%s\n", g);
+                }
+                if (!s->tl_host.empty()) {
+                    char h[192];
+                    moe_wd_host_ring(h, sizeof(h), s, seq);
+                    GGML_LOG_ERROR("%s\n", h);
+                }
+            }
+        }
+    }
+}
+
 bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) {
     cudaStream_t stream = (cudaStream_t) stream_ptr;
     cudaEvent_t event = (cudaEvent_t) event_ptr;
@@ -10330,9 +10656,25 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) 
     for (int k = 0; k < n_st; k++) {
         serving[k] = std::unique_lock<std::mutex>(sts[k]->serve_mu, std::try_to_lock);
     }
+    moe_wd_phase(10);
     moe_hosted_state * st = sts[0];
     const bool tl_on = !st->tl_host.empty();
+    // DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_WATCHDOG=s): this wait has run s seconds without the stream
+    // finishing: print the host and GPU (timeline) views of the exchange it waits for; with it set, a
+    // separate thread prints the same view every 5 s, wherever the waiting thread is
+    static const int wd_s = getenv("GGML_CUDA_MOE_HOSTED_WATCHDOG") ? atoi(getenv("GGML_CUDA_MOE_HOSTED_WATCHDOG")) : 0;
+    if (wd_s > 0) {
+        static std::once_flag wd_started;
+        std::call_once(wd_started, [] {
+            std::thread(moe_hosted_watchdog_loop).detach();
+            std::thread(moe_wd_probe_loop).detach();
+        });
+    }
+    int64_t wd_enter = 0, wd_last = 0;
+    int wd_gate = 0;
     for (;;) {
+        g_wd_hb.fetch_add(1, std::memory_order_relaxed);
+        moe_wd_phase(11);
         const int64_t tq = tl_on ? moe_tl_now_ns() : 0;
         const cudaError_t done = event ? cudaEventQuery(event) : cudaStreamQuery(stream);
         if (tl_on) {
@@ -10355,6 +10697,7 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) 
                     moe_cache_prefill_unpin_locked(*sts[k]->session);
                 }
             }
+            moe_wd_phase(99);
             return true;
         }
         bool served = false;
@@ -10363,12 +10706,43 @@ bool ggml_cuda_moe_hosted_wait(void * stream_ptr, void * event_ptr, int device) 
             const uint32_t seq = __atomic_load_n(&s->h_mail->seq, __ATOMIC_ACQUIRE);
             if (serving[k].owns_lock() && seq != s->last_seq) {
                 s->last_seq = seq;
+                moe_wd_phase(13);
                 moe_hosted_serve_one(s, seq);
                 served = true;
             }
         }
         if (served) {
             continue;
+        }
+        if (wd_s > 0) {
+            if (wd_enter == 0) {
+                wd_enter = ggml_time_us();
+                wd_last = wd_enter;
+            } else if (++wd_gate & ((1 << 20) - 1)) {
+                const int64_t now = ggml_time_us();
+                if (now - wd_last >= (int64_t) wd_s * 1000000LL) {
+                    wd_last = now;
+                    for (int k = 0; k < n_st; k++) {
+                        moe_hosted_state * s = sts[k];
+                        const uint32_t seq = __atomic_load_n(&s->h_mail->seq, __ATOMIC_ACQUIRE);
+                        const uint32_t slot = __atomic_load_n(&s->h_mail->slot, __ATOMIC_RELAXED);
+                        const uint32_t ntok = __atomic_load_n(&s->h_mail->n_tokens, __ATOMIC_RELAXED);
+                        uint32_t rflag = 0;
+                        {
+                            std::lock_guard<std::mutex> lock(s->mu);
+                            const moe_hosted_layer * ly = slot < s->layers.size() ? s->layers[slot].get() : nullptr;
+                            if (ly) {
+                                rflag = __atomic_load_n(&ly->h_flags[16], __ATOMIC_RELAXED);
+                            }
+                        }
+                        const unsigned long long pub = g_tl_h ? g_tl_h[(seq % MOE_TL_RING) * 8 + 0] : 0;
+                        const unsigned long long plan = g_tl_h ? g_tl_h[(seq % MOE_TL_RING) * 8 + 1] : 0;
+                        const unsigned long long mrg = g_tl_h ? g_tl_h[(seq % MOE_TL_RING) * 8 + 2] : 0;
+                        GGML_LOG_ERROR("[moe-cache] WATCHDOG: no stream progress for %d s (waiting %lld ms): mail %u, served %u (slot %u, %u tok), rows flag %u, tl: pub %llu plan %llu merge %llu\n",
+                                wd_s, (long long) (now - wd_enter), seq, s->last_seq, slot, ntok, rflag, pub, plan, mrg);
+                    }
+                }
+            }
         }
 #if defined(__x86_64__)
         __builtin_ia32_pause();
@@ -10691,6 +11065,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
         if (st->d_q8_count) cudaFree(st->d_q8_count);
         if (st->d_router_done) cudaFree(st->d_router_done);
         if (st->d_router_tagged) cudaFree(st->d_router_tagged);
+        if (st->d_keep_sink) cudaFree(st->d_keep_sink);
         // the pins of the last plan go with the pools the session is about to free
     }
 }
@@ -11587,18 +11962,33 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                                               st->d_seq, layer->d_expect, st->m_mail, (uint32_t) slot, layer->m_flags,
                                               layer->m_plan, layer->d_plan, 3 * rows, g_tl_m, rta,
                                               w_src, w_src ? layer->m_w : nullptr);
-    // a block launched now (not recorded into a graph) waits for its mailbox: the server thread serves it
+    cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
+    const bool non_capture = cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone;
+    // clock keeper: the merge's trailing workgroups hold ALU work across the layer's poll window; not a
+    // separate stream, which added a HW queue that oversubscribed the runlist and stopped a stream
+    // draining (issue 27 bench)
+    float * keep_sink = nullptr;
+    int n_keep = 0;
     {
-        cudaStreamCaptureStatus capture = cudaStreamCaptureStatusNone;
-        if (cudaStreamIsCapturing(stream, &capture) == cudaSuccess && capture == cudaStreamCaptureStatusNone) {
-            {
-                std::lock_guard<std::mutex> lock(st->server_mu);
-                st->server_pending++;
+        static const bool keep = getenv("GGML_CUDA_MOE_CLOCK_KEEP") && atoi(getenv("GGML_CUDA_MOE_CLOCK_KEEP")) != 0;
+        static const int keep_rows = getenv("GGML_CUDA_MOE_CLOCK_KEEP_ROWS") ? atoi(getenv("GGML_CUDA_MOE_CLOCK_KEEP_ROWS")) : 1024;
+        if (non_capture && keep && rows >= keep_rows) {
+            if (!st->d_keep_sink) {
+                CUDA_CHECK(cudaMalloc((void **) &st->d_keep_sink, MOE_CLOCK_KEEP_CTAS * 256 * sizeof(float)));
             }
-            st->server_cv.notify_one();
+            keep_sink = st->d_keep_sink;
+            n_keep = MOE_CLOCK_KEEP_CTAS;
         }
-        (void) cudaGetLastError();
     }
+    // a block launched now (not recorded into a graph) waits for its mailbox: the server thread serves it
+    if (non_capture) {
+        {
+            std::lock_guard<std::mutex> lock(st->server_mu);
+            st->server_pending++;
+        }
+        st->server_cv.notify_one();
+    }
+    (void) cudaGetLastError();
     if (tk) {
         tp.logits = nullptr;
     }
@@ -11767,7 +12157,7 @@ int ggml_cuda_moe_hosted_block(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
         ggml_cuda_set_device(ctx.device);
     }
     g_hosted_pending = {layer, down, rows, split_on, moe_sgate_find(ctx, cgraph, i, act, down, (int) n_tokens), cards,
-                        st->m_split_diag, n_used, cards && w_src != nullptr};
+                        st->m_split_diag, n_used, cards && w_src != nullptr, keep_sink, n_keep};
     return 3;
 }
 
@@ -11787,12 +12177,13 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
         }
     }
     ggml_cuda_q8_1_reuse_written(ctx, p.down);
-    k_moe_hosted_merge<<<p.rows + (p.sg.x ? 1 : 0), 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
+    k_moe_hosted_merge<<<p.rows + (p.sg.x ? 1 : 0) + p.n_keep, 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
                                                           p.layer->d_rows_ready, p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
                                                           p.layer->m_res,
                                                           (float *) p.down->data, (int) p.layer->n_embd, g_tl_m, p.sg,
                                                           p.cards ? p.layer->m_src : nullptr, p.layer->m_flags,
-                                                          p.cards ? p.diag : nullptr, p.n_used, p.psum ? 1 : 0);
+                                                          p.cards ? p.diag : nullptr, p.n_used, p.psum ? 1 : 0,
+                                                           p.d_keep_sink, p.n_keep);
     CUDA_CHECK(cudaGetLastError());
     p = {};
 }
