@@ -125,8 +125,10 @@ frozen (2x V620 gfx1030, Strata engine, MTP drafter + verify streams).
   engine-grant path; the firmware is the real fix for the stall/hang class.
   The >=2400 MHz hard-reset class is a separate power transient and stays with
   the 2200 cap.
-- Ask bilboquet for `dmesg | grep -i mec` + a fw-update test (draft 2 in
-  gfx1030-repro/issue27-reply-draft.md).
+- Ask bilboquet for `cat /sys/class/drm/card*/device/fw_version/mec_fw_version` + a
+  fw-update test via `amdgpu-install --usecase=dkms` (repo.radeon.com amdgpu 31.60;
+  revert: `amdgpu-uninstall`). Full steps in draft 2 of
+  gfx1030-repro/issue27-reply-draft.md.
 
 ## Fix implications (Phase 4 re-ranked from the table)
 
@@ -145,7 +147,8 @@ frozen (2x V620 gfx1030, Strata engine, MTP drafter + verify streams).
 - Isolate why the reference command resets 0.7 s into the short request while our command
   reset at calibration instead: next one-variable test for the reporter is
   `GPU_MAX_HW_QUEUES=2` added to our command.
-- Reporter to check MEC firmware (`dmesg | grep -i mec`) and test `0x86` from a newer
+- Reporter to check MEC firmware
+  (`cat /sys/class/drm/card*/device/fw_version/mec_fw_version`) and test `0x86` from a newer
   amdgpu-dkms (TheRock#9306: zero hangs, +10 % prompts). If clean, drop
   `HSA_ENABLE_SDMA=0`, keep `GPU_MAX_HW_QUEUES=2`.
 - `ggml_cuda_moe_hosted_wait` needs an escape or loud diagnostic: with a lost dispatch
