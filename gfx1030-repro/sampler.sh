@@ -1,11 +1,14 @@
 #!/usr/bin/env bash
 # 200 ms GPU + RAM sampler for the issue 27 reset trace (Avalon gfx1030).
 # usage: sampler.sh [outfile] [duration_s] [pci_bdf]
-#   pci_bdf: e.g. 0000:03:00.0 - default: the first amdgpu that reports gpu_busy_percent
+#   pci_bdf: 0000:03:00.0 or a /sys/bus/pci path - default: the first amdgpu that reports gpu_busy_percent
 #   duration 0 = until killed
 # Records busy %, sclk, power, temp, MemAvailable and the PCIe AER fatal counter.
 # Keep it running across the reset hunt; after reboot the CSV ends where the machine died.
+# A hard reset drops what is still in the page cache, so each sample is synced out; that also
+# flushes the server log. If even that loses the tail, stream it off box: tail -F out.csv | nc HOST PORT
 set -u
+export LC_ALL=C  # awk must print dot decimals, not the locale comma
 OUT=${1:-sampler.csv}
 DUR=${2:-0}
 D=${3:-}
@@ -13,6 +16,8 @@ if [ -z "$D" ]; then
     for f in /sys/bus/pci/devices/*/gpu_busy_percent; do
         [ -e "$f" ] && D=$(dirname "$f") && break
     done
+elif [ ! -d "$D" ] && [ -d "/sys/bus/pci/devices/$D" ]; then
+    D="/sys/bus/pci/devices/$D"  # bare BDF: point it at sysfs
 fi
 [ -n "$D" ] || { echo "no amdgpu device with gpu_busy_percent found" >&2; exit 1; }
 H=$(ls -d "$D"/drm/card*/device/hwmon/hwmon* 2>/dev/null | head -1)
@@ -34,5 +39,6 @@ while :; do
         "$(rd "$H/temp1_input")" \
         "$(awk '/MemAvailable/{print $2}' /proc/meminfo)" \
         "$(aer_fatal)" >> "$OUT"
+    sync  # so a hard reset cannot take the last samples (nor the server log) with it
     sleep 0.2
 done
