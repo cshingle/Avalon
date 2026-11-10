@@ -213,6 +213,29 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// DIAGNOSTIC (GGML_CUDA_MOE_HOSTED_WATCHDOG=s > 0): a caller-side phase point for the hosted hang
+// (issue 27 bench): the last printed marker before the hang is the call the main thread is in
+static bool moe_wd_on() {
+    static const bool on = getenv("GGML_CUDA_MOE_HOSTED_WATCHDOG") != nullptr &&
+                           atoi(getenv("GGML_CUDA_MOE_HOSTED_WATCHDOG")) > 0;
+    return on;
+}
+
+static void moe_wd_mark(int phase, const char * what) {
+    if (!moe_wd_on()) {
+        return;
+    }
+    GGML_LOG_ERROR("[moe-cache] WD: %s\n", what);
+    ggml_cuda_moe_wd_phase(phase);
+}
+
+static void moe_wd_probe_set(ggml_backend_cuda_context * ctx) {
+    if (!moe_wd_on()) {
+        return;
+    }
+    ggml_cuda_moe_wd_set_probe_stream(ctx->stream(), ggml_cuda_get_device());
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -905,6 +928,7 @@ static scratch_prime_t ggml_cuda_pick_scratch_prime(size_t bytes, size_t & got) 
 }
 
 void ggml_cuda_prime_queues(int device) {
+    moe_wd_mark(28, "prime queues");
     std::lock_guard<std::mutex> lock(g_cuda_contexts_mutex);
     // the null stream too: the hosted MoE's first memset runs there, and since the buffer-init padding memsets moved to
     // the per-thread stream (#28782) nothing else dispatched on it before the cache was sized (a 38.4 MiB save area)
@@ -1019,6 +1043,7 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
+    moe_wd_mark(27, "buffer init_tensor");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     if (tensor->view_src != NULL) {
@@ -1041,6 +1066,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 }
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
+    moe_wd_mark(27, "buffer memset_tensor");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -1065,6 +1091,7 @@ static cudaError_t ggml_cuda_memcpy_2d_h2d_async(void * dst, size_t dpitch, cons
 }
 
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
+    moe_wd_mark(27, "buffer set_tensor");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -1073,15 +1100,19 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
+    moe_wd_mark(27, "buffer get_tensor");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    moe_wd_mark(30, "get_tensor: before D2H memcpy");
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    moe_wd_mark(31, "get_tensor: before stream sync");
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    moe_wd_mark(27, "buffer set_tensor_2d");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -1092,15 +1123,19 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
 
 static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer, const struct ggml_tensor * tensor, void * data,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
+    moe_wd_mark(27, "buffer get_tensor_2d");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
+    moe_wd_mark(30, "get_tensor_2d: before D2H memcpy");
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    moe_wd_mark(31, "get_tensor_2d: before stream sync");
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    moe_wd_mark(27, "buffer cpy_tensor");
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -1126,6 +1161,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 }
 
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
+    moe_wd_mark(27, "buffer clear");
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
     ggml_cuda_set_device(ctx->device);
@@ -6888,7 +6924,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         }
         // Launch graph (EXPERT SPLIT: the other cards' graphs recorded with it first)
         ggml_cuda_moe_split_graph_launch(cuda_ctx->device, graph);
+        moe_wd_mark(21, "before cudaGraphLaunch");
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        moe_wd_mark(22, "after cudaGraphLaunch");
         cuda_ctx->split_wait_queued |= graph->split_wait;
 #else
         GGML_UNUSED(graph_key);
@@ -6918,6 +6956,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    moe_wd_mark(20, "graph_compute");
+    moe_wd_probe_set(cuda_ctx);
 
     // the q8_1 reuse buffer (ggml_cuda_q8_1_reuse): allocated here, never inside a graph capture;
     // 1 MiB holds the activations of up to 64 rows of 10240 (larger ones are not reused)
@@ -6995,7 +7035,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
 static void ggml_backend_cuda_event_record(ggml_backend_t backend, ggml_backend_event_t event) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
+    moe_wd_mark(23, "before cudaEventRecord");
     CUDA_CHECK(cudaEventRecord((cudaEvent_t)event->context, cuda_ctx->stream()));
+    moe_wd_mark(24, "after cudaEventRecord");
 }
 
 static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_event_t event) {
@@ -8432,7 +8474,9 @@ static void ggml_backend_cuda_device_event_free(ggml_backend_dev_t dev, ggml_bac
 
 static void ggml_backend_cuda_device_event_synchronize(ggml_backend_dev_t dev, ggml_backend_event_t event) {
     GGML_UNUSED(dev);
+    moe_wd_mark(25, "event sync: moe wait");
     if (!ggml_cuda_moe_hosted_wait(nullptr, event->context, -1)) {
+        moe_wd_mark(26, "event sync: cudaEventSynchronize");
         CUDA_CHECK(cudaEventSynchronize((cudaEvent_t)event->context));
     }
 }
