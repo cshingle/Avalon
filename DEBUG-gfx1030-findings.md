@@ -125,6 +125,13 @@ frozen (2x V620 gfx1030, Strata engine, MTP drafter + verify streams).
   engine-grant path; the firmware is the real fix for the stall/hang class.
   The >=2400 MHz hard-reset class is a separate power transient and stays with
   the 2200 cap.
+- BENCH CHECK: our 6900 XT has carried MEC `0x86` since Oct 31 (amdgpu-dkms
+  7.1.9-2407772 / amdgpu-install 31.60, boot 2026-11-08), and the 4/4 first-request
+  stall control was measured on top of it. fw `0x86` does not clear the Avalon
+  stall pattern on our hardware; it cleared the Strata variant upstream. The
+  engine-grant path evidently has more than one entry. Worth posting upstream
+  (AMD is active on 9306): gfx1030 + MEC 0x86, Avalon cache-lend stall persists
+  4/4; `GPU_MAX_HW_QUEUES=2` and `HIP_ENABLE_DEFERRED_LOADING=0` clear it here.
 - Ask bilboquet for `cat /sys/class/drm/card*/device/fw_version/mec_fw_version` + a
   fw-update test via `amdgpu-install --usecase=dkms` (repo.radeon.com amdgpu 31.60;
   revert: `amdgpu-uninstall`). Full steps in draft 2 of
