@@ -108,6 +108,26 @@ MoE block (ffn_moe_gate-1)` (ggml-cuda.cu:6744) - should fall back instead of cr
 - Workaround cost on their box: short-request prefill 75 t/s (full clock, MAX_ROWS=256)
   vs 180 t/s (2200 cap, defaults); they keep the clock cap for daily use.
 
+## 2026-11-09: upstream TheRock#9306 progress (MEC firmware lead)
+
+9306 is the same stall signature as our first-request stall: idle MEC pipes in
+front of active HQDs holding pending well-formed AQL packets, no waves, no fault,
+frozen (2x V620 gfx1030, Strata engine, MTP drafter + verify streams).
+
+- `GPU_MAX_HW_QUEUES=2` avoids it upstream too: HIP maps streams to HW queues
+  round-robin in creation order, so queues=2 puts drafter and verify on the same
+  queue (116/116 clean there, matches our and cshingle's clean runs).
+- AMD reproduced 1/14 cold-start first-requests on MEC firmware `0x83`; ROCm
+  nightly 10.3.0a20261023 made it rarer, not fixed.
+- MEC firmware `0x86`, shipped by newer `amdgpu-dkms`: the 9306 reporter ran two
+  days / hundreds of requests with zero hangs and ~10 % faster prompts.
+- So: env-var workarounds (deferred-loading=0, SDMA=0, queues=2) all dodge the
+  engine-grant path; the firmware is the real fix for the stall/hang class.
+  The >=2400 MHz hard-reset class is a separate power transient and stays with
+  the 2200 cap.
+- Ask bilboquet for `dmesg | grep -i mec` + a fw-update test (draft 2 in
+  gfx1030-repro/issue27-reply-draft.md).
+
 ## Fix implications (Phase 4 re-ranked from the table)
 
 1. Kill the poller->burst step on gfx103x: (a) shorten/avoid the poller phase (overlap
@@ -125,6 +145,11 @@ MoE block (ffn_moe_gate-1)` (ggml-cuda.cu:6744) - should fall back instead of cr
 - Isolate why the reference command resets 0.7 s into the short request while our command
   reset at calibration instead: next one-variable test for the reporter is
   `GPU_MAX_HW_QUEUES=2` added to our command.
+- Reporter to check MEC firmware (`dmesg | grep -i mec`) and test `0x86` from a newer
+  amdgpu-dkms (TheRock#9306: zero hangs, +10 % prompts). If clean, drop
+  `HSA_ENABLE_SDMA=0`, keep `GPU_MAX_HW_QUEUES=2`.
+- `ggml_cuda_moe_hosted_wait` needs an escape or loud diagnostic: with a lost dispatch
+  the event-query spin loop runs forever (reporter's single 1500 MHz hang).
 - Candidate 1 (kill the poller->burst step) must not cost short-prefill speed: bench gate
   = the 13 W/499 MHz -> 196 W/2540 MHz step attenuates and t/s is unchanged (the reporter
   keeps the clock cap because MAX_ROWS=256 costs short prefill 180->75 t/s).
