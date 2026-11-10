@@ -80,6 +80,34 @@ Fork bug found on the way: with the cache pool squeezed to 486 MiB
 `ggml_cuda_graph_evaluate_and_capture: MUL_MAT_ID with host weights outside a hosted
 MoE block (ffn_moe_gate-1)` (ggml-cuda.cu:6744) - should fall back instead of crashing.
 
+## 2026-11-09: reporter's harness runs (their RX 6800 XT, branch 51e4d5b)
+
+- Interim confirmed: `GGML_MOE_HOSTED_MAX_ROWS=256`, full clock (2454-2459 MHz), cold cache
+  restart before each replay: 10/10 no reset; short-request ttft 8.7 s, peak 2548 MHz/246 W.
+- Hosted default + our replay command: reset inside the first request of the whole run -
+  replay.py's 6444-token calibration, 2048-token ubatches (all above the 1024-token hosted
+  cap, so non-hosted), ~12.3 s in at the 3rd ubatch boundary, right after
+  `give back: 1024 MiB` -> `loan plan: chunks MiB 84` -> `borrow: 84 MiB at 366 MiB`.
+  Last sample 99 %/2515 MHz/141 W, AER fatal 0; kernel log empty at the dead boot, no
+  MCE/AER/BERT next boot. A cold non-hosted prefill from idle can kill at full clock too
+  (second stressor, same family as the ub9536 row). With MAX_ROWS=256 calibration passed
+  10/10; MAX_ROWS also changes the hosted session/loan state at load, so that pass is not
+  proof the calibration path itself changed.
+- Same build, capped 2200 MHz: whole replay passes (peak 2205 MHz/214 W).
+- Reference build (8c4e475 + PR #15 patch, no newer commits), their usual settings
+  (`GPU_MAX_HW_QUEUES=2`, default verbosity, no taskset): calibration + 22.9k pass, reset
+  ~0.7 s into the ~600-token short request after 5 s idle. Default verbosity suppresses all
+  ggml lines (the -lv 3 trap), so "no hosted lines" proves nothing there; hosted is
+  eligible at ~600 tokens (<=1024 tokens, ~6000 rows <= 8191 gate) and probably ran.
+  What differs vs our command (HW queues, taskset/-t 16, -lv 5, STATS=8, 22 commits) is
+  not isolated yet.
+- One hang, no reset (GPU capped 1500 MHz, -lv 4): main thread spinning in
+  `ggml_cuda_moe_hosted_wait` (8c4e475 moe-cache.cu:8475 = the cudaEventQuery poll loop).
+- Stock llama.cpp shows no runlist-oversubscription warning; confirmed it is Avalon's
+  queue count.
+- Workaround cost on their box: short-request prefill 75 t/s (full clock, MAX_ROWS=256)
+  vs 180 t/s (2200 cap, defaults); they keep the clock cap for daily use.
+
 ## Fix implications (Phase 4 re-ranked from the table)
 
 1. Kill the poller->burst step on gfx103x: (a) shorten/avoid the poller phase (overlap
@@ -94,10 +122,13 @@ MoE block (ffn_moe_gate-1)` (ggml-cuda.cu:6744) - should fall back instead of cr
 
 ## Open items
 
-- Phase 2 rows still to capture: 166-token follow-up (their stable threshold), the
-  tail-chunk case (hosted batch while GPU already busy), and the `-b 9536` 30k prefill
-  reset path (not hosted; the :9931 daily server runs those flags, fingerprint it here).
-- Their card runs with cache lending active (`borrow`/`loan plan` lines); ours never
-  lends. If lending changes the fingerprint (pool copies during the poller phase), we
-  must reproduce it here - tighten the cache budget to force lending.
-- `GGML_MOE_HOST_DEBUG` prints in ggml-backend.cpp are TEMP; remove before any PR.
+- Isolate why the reference command resets 0.7 s into the short request while our command
+  reset at calibration instead: next one-variable test for the reporter is
+  `GPU_MAX_HW_QUEUES=2` added to our command.
+- Candidate 1 (kill the poller->burst step) must not cost short-prefill speed: bench gate
+  = the 13 W/499 MHz -> 196 W/2540 MHz step attenuates and t/s is unchanged (the reporter
+  keeps the clock cap because MAX_ROWS=256 costs short prefill 180->75 t/s).
+- This branch was rebased onto the PR #15 head (stream swap removed, SDMA warning at
+  load); the reporter's Nov 9 build `51e4d5b` stays fetchable by SHA.
+- Closed: the 166/busy/ub9536 rows are captured (runs 11-14); forced cache lending does
+  not change the fingerprint (run14); TEMP `GGML_MOE_HOST_DEBUG` prints were removed.
