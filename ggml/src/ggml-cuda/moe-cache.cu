@@ -7560,7 +7560,8 @@ struct moe_hosted_layer {
     uint64_t * h_plan2k = nullptr;
     uint64_t * m_plan2k = nullptr;
     int split_pending_k[MOE_SPLIT_MAX_CARDS + 1] = {};
-    uint32_t * d_expect = nullptr;  // sequence number of the layer's last publication
+    uint32_t * d_expect = nullptr;   // sequence number of the layer's last publication
+    uint32_t * d_rows_ready = nullptr;   // the rows flag in VRAM: the merge's first workgroup relays the host flag to it
 };
 
 // SPLIT: the dispatcher's CPU time model (moe_split_cpu_*) was fitted on one machine; on another the CPU rows take
@@ -8556,7 +8557,7 @@ static __global__ void k_split_card_psum(const uint64_t * d_plan, const uint64_t
 }
 
 static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volatile uint32_t * flag,
-                                          const uint64_t * d_down_ids, const uint64_t * d_moved_down_ids,
+                                          volatile uint32_t * d_rows_ready, const uint64_t * d_down_ids, const uint64_t * d_moved_down_ids,
                                           const volatile float * m_res, float * dst, int n_embd,
                                           volatile unsigned long long * tl, const moe_sgate_args sg,
                                           const volatile int8_t * m_src, const volatile uint32_t * flags,
@@ -8564,6 +8565,16 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
     if (sg.x && blockIdx.x == gridDim.x - 1) {
         moe_sgate_body(sg);   // the last workgroup: the shared expert's gate
         return;
+    }
+    if (blockIdx.x == 0 && threadIdx.x == 0) {
+        // relay the rows flag to VRAM: many concurrent readers of the host line do not see the host's store
+        // (gfx1030), so the rows' workgroups wait on the relay, this workgroup is the line's single reader
+        const uint32_t expect = *d_expect;
+        while ((int32_t) (*flag - expect) < 0) {
+            moe_hosted_pause();
+        }
+        __threadfence_system();
+        *d_rows_ready = expect;
     }
     const int row = blockIdx.x;
     if (d_down_ids[row] != 0 || (d_moved_down_ids && d_moved_down_ids[row] != 0)) {
@@ -8575,7 +8586,7 @@ static __global__ void k_moe_hosted_merge(const uint32_t * d_expect, const volat
         zero = 0;
         expect = *d_expect;
         const unsigned long long t0 = tl ? moe_tl_clock() : 0;
-        while ((int32_t) (*flag - expect) < 0) {
+        while ((int32_t) (*d_rows_ready - expect) < 0) {
             moe_hosted_pause();
         }
         __threadfence_system();
@@ -10669,7 +10680,7 @@ static void moe_hosted_shutdown(moe_cache_session * session) {
             for (void * h : {(void *) layer->h_flags}) {
                 if (h) cudaFreeHost(h);
             }
-            for (void * d : {(void *) layer->d_act_ids, (void *) layer->d_expect}) {
+            for (void * d : {(void *) layer->d_act_ids, (void *) layer->d_expect, (void *) layer->d_rows_ready}) {
                 if (d) cudaFree(d);
             }
         }
@@ -10770,14 +10781,16 @@ static moe_hosted_layer * moe_hosted_register(moe_hosted_state & st, moe_cache_d
     ok = ok && cudaMalloc((void **) &layer->d_fetch, (1 + 3 * MOE_SPLIT_FETCH_MAX) * sizeof(uint64_t)) == cudaSuccess &&
          cudaMemset(layer->d_fetch, 0, sizeof(uint64_t)) == cudaSuccess &&
          cudaMalloc((void **) &layer->d_act_ids, rows * sizeof(int32_t)) == cudaSuccess &&
-         cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess;
+         cudaMalloc((void **) &layer->d_expect, sizeof(uint32_t)) == cudaSuccess &&
+         cudaMalloc((void **) &layer->d_rows_ready, sizeof(uint32_t)) == cudaSuccess;
     if (ok) {
         std::vector<int32_t> act_ids(rows);
         for (int row = 0; row < rows; row++) {
             act_ids[row] = row / n_used;
         }
         ok = cudaMemcpy(layer->d_act_ids, act_ids.data(), rows * sizeof(int32_t), cudaMemcpyHostToDevice) == cudaSuccess &&
-             cudaMemset(layer->d_expect, 0, sizeof(uint32_t)) == cudaSuccess;
+             cudaMemset(layer->d_expect, 0, sizeof(uint32_t)) == cudaSuccess &&
+             cudaMemset(layer->d_rows_ready, 0, sizeof(uint32_t)) == cudaSuccess;
     }
     if (!ok) {
         (void) cudaGetLastError();
@@ -11775,7 +11788,7 @@ void ggml_cuda_moe_hosted_flush(ggml_backend_cuda_context & ctx, const ggml_tens
     }
     ggml_cuda_q8_1_reuse_written(ctx, p.down);
     k_moe_hosted_merge<<<p.rows + (p.sg.x ? 1 : 0), 256, 0, ctx.stream()>>>(p.layer->d_expect, p.layer->m_flags + 16,
-                                                          p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
+                                                          p.layer->d_rows_ready, p.layer->d_plan + 2 * p.rows, p.split ? p.layer->d_plan2 + 2 * p.rows : nullptr,
                                                           p.layer->m_res,
                                                           (float *) p.down->data, (int) p.layer->n_embd, g_tl_m, p.sg,
                                                           p.cards ? p.layer->m_src : nullptr, p.layer->m_flags,
