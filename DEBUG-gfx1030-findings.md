@@ -137,6 +137,174 @@ frozen (2x V620 gfx1030, Strata engine, MTP drafter + verify streams).
   revert: `amdgpu-uninstall`). Full steps in draft 2 of
   gfx1030-repro/issue27-reply-draft.md.
 
+## 2026-11-10: MTP masks the trigger on the bench; keeper v2 had a 30 s stray spin
+
+MTP masking (v2 build, gate runs): with the reporter's recipe (`--spec-type
+draft-mtp`) the card holds ~2550 MHz / 44 W / 99 % busy through the replay's 5 s
+idle - the spec-decoder keeps it hot, so the 499 MHz/13 W poller floor and the
+poller->burst power step never appear (gate-base2.csv vs run8.csv). With
+`REPRO_MTP=0` (new server.sh env gate, default on) the card cools to 0 % busy / 5 W
+in the gap and the short request re-triggers the step: 5 W idle -> 499 MHz/13 W at
+onset -> 2539 MHz burst peaking 222 W (gate-base-nomtp.csv). ttft: big 94.6 s /
+short 3.7 s nomtp vs 113.2 / 4.6 with MTP - the spec-decoder costs ~19 s on the big
+prefill too.
+
+Keeper v2 (stop-seq) gate, `REPRO_MTP=0`, knob on (gate-keep-nomtp.csv): the stop
+mechanism failed. One keeper kernel launched mid-big-prefill (t150.4) never saw the
+host's stores to the mapped stop word and spun its full 30 s cap (to t180.4): a
+visible 44 W / 99 % / 2550 MHz plateau across the "5 s idle" and the whole short
+request, +13.6 s on the big ttft (108.2 vs 94.6), and the short prefill's GEMMs only
+ran after the cap expired. The other keepers stopped promptly; the difference vs the
+enter kernel's proven mailbox wait is that all 16384 keeper threads hammered the one
+sysmem line instead of one thread polling at the `s_sleep` pace while the rest read
+device memory.
+
+v2b (re-gate pending): the kernel's thread 0 of block 0 is now the only stop-word
+poller (enter-kernel pace) and raises a VRAM flag (the seq, monotone, no reset); the
+workers follow the flag. Cap 30 s -> 500 ms (6x over the ~50-80 ms cold poll window;
+bounds a stale-observer kernel to 0.5 s). `keep_seq` is `std::atomic` and is bumped
+before the notify so the serving thread's stop store cannot race it.
+
+## 2026-11-10: lost-dispatch hang confirmed on the bench (6 h, v2b build, knob on)
+
+The v2b keeper gate hung in the big prefill of its first replay, ~63 s into the
+server's life (after the two calibrate prefills): the 22969-token request never
+produced a stat line; the server then sent only SSE keep-alive pings for 6.2 h.
+Power: flat ~205 W / 99 % busy the whole time (a zombie kernel's surviving
+wavefronts), one CPU core 100 % with 4.4 h of it in kernel time.
+
+Diagnosis (process alive, no ptrace allowed here): the main thread spins in
+`ggml_cuda_moe_hosted_wait` (`cudaStreamQuery` + `pause`, state R) - the stream
+never completes; the serving thread sleeps in `kfd_wait_on_events` (7.5 s CPU
+total, i.e. it went idle, it did not wedge on a lock); no other thread burns
+anything. So a kernel on the GPU is stuck (fetch never returns), the stream never
+completes, and the known event-query spin runs forever - the open item's
+"lost dispatch" failure, now reproduced here (it was only the reporter's one-off
+1500 MHz hang before).
+
+Context: dmesg shows `Runlist is getting oversubscribed due to too many queues`
+on every run of this setup (keeper and knob-off alike, all completed ones included)
+- chronic, not the trigger. The v2 keeper run (same knob-on big prefill, 24 h of
+layers of launches) completed, so the hang is not deterministically keeper-caused;
+treat as random driver/fabric wedge, keeper involvement unproven. Killed replay +
+server + sampler: no reset event in dmesg, no reboot; sensors went EBUSY after the
+kill (they had been EBUSY on manual reads all day while the 0.2 s sampler worked) -
+knob-off control run is the recovery test.
+
+## 2026-11-10: keeper hang, 7/7 knob-on, 0/7 knob-off - root cause: runlist queue oversubscription
+
+Knob-on gates hung 7/7 (keep2b, keep2c, gate-wd, gate-relay-k1, gate-diag-k1,
+gate-diag2-k1, gate-diag3-k1), knob-off 0/7, always at the same spot: at the
+end of the first calibration prefill (6444 tok), in the context checkpoint's
+D2H, before the second request starts. GPU flat ~196-212 W / 99 % / ~2505 MHz
+until the kill; the log is SSE pings only; no AER fatal, no reset; the kill
+recovers the card.
+
+The chain (each link measured, not inferred):
+
+1. The knob's keeper ran on its own stream; its first dispatch (the first
+   hosted layer with rows >= 1024, ~45-48 s uptime in this repro) added a new
+   HW queue and dmesg logged, at that exact instant in every knob-on run,
+   `amdgpu: Runlist is getting oversubscribed due to too many queues. Expect
+   reduced ROCm performance.` (12:15:44, 12:49:36, 13:22:19, 13:58:11,
+   14:09:10 - all ~+46 s after their server start; the knob-off run
+   12:43:08 has no warning).
+2. After the oversubscription the runlist stopped servicing some queues:
+   - the keep queue: wedged from birth - a 1-CTA probe kernel launched on it
+     blocks in the launch call ~2.0 s and never runs (its GPU wall tick never
+     advances; "kernel NOT done in 2 s" for minutes).
+   - the main thread's per-thread stream queue: wedged - the checkpoint's D2H
+     copies never run.
+   - the compute stream queue: serviced (probe launches in ~10 ms, kernels
+     complete, tick advances) - which is why the prefill's waits all returned
+     normally and no hosted kernel was visibly stuck.
+3. The stuck call, pinned with caller-side markers (last one printed before
+   the hang): the checkpoint is 200+ `ggml_backend_cuda_buffer_get_tensor`
+   calls (D2H via `cudaMemcpyAsync` on `cudaStreamPerThread` +
+   `cudaStreamSynchronize`); the last one's memcpy returned and
+   `cudaStreamSynchronize(cudaStreamPerThread)` never did - main spins in it
+   at 100 % CPU (R, wchan 0) for 190+ s.
+4. The ~200 W / 99 % is the runlist polling the descheduled queues: no visible
+   wavefront work on any serviced queue (dmesg clean, kill recovers).
+
+bilboquet's one-off 1500 MHz hang (main in `ggml_cuda_moe_hosted_wait` via
+`device_event_synchronize`) is the same family: a sync on a stream whose work
+never runs under queue pressure (his card: MEC 0x86 + ROCm 7.14.1, he runs
+`GPU_MAX_HW_QUEUES=2`); his stuck call is the moe wait, ours the checkpoint
+D2H - different victim, same trigger class.
+
+The earlier multi-reader merge theory is refuted (the single-reader relay was
+in the binary that hung 2/2 identically) and was a red herring: the stuck
+point was never a hosted kernel wait.
+
+**Fix (keeper v3, in-merge keeper)**: the keeper is no longer a stream. With
+the knob on and rows >= 1024, the merge kernel's grid gets K = 64 trailing
+workgroups that run the same fmaf spin as before (64 x 256 threads, ~44 W),
+wait on the relay's VRAM word (d_rows_ready - safe for many readers; the host
+line is not), and are capped on the GPU clock. The window they hold is the
+same (the merge is resident exactly across the CPU rows' wait). No new stream
+-> no new HW queue -> no oversubscription. Removed: keep_stream, the host stop
+word, d_keep_flag, keep_seq, k_moe_clock_keep, the serving thread's stop
+store.
+
+**Diagnostics kept** (GGML_CUDA_MOE_HOSTED_WATCHDOG=s > 0, off by default):
+detached thread printing every 5 s - main's phase (10-13 the wait loop,
+20-31 caller-side markers: graph_compute, before/after cudaGraphLaunch,
+before/after cudaEventRecord, event sync, buffer op, before the D2H, before
+the per-thread sync, prime queues) + the escape loop's heartbeat, the
+per-state host view (mail/served/plan/rows flags, pending), the GPU + host
+timeline rings, the process threads (state, ticks); plus a liveness-probe
+thread (1-CTA kernels on the compute stream and the probe thread's per-thread
+stream writing the GPU wall clock to mapped memory - a blocked launch or a
+stale tick names a wedged queue).
+
+## 2026-11-10: relay + keeper-v3 gate results (REPRO_MTP=0, knob = GGML_CUDA_MOE_CLOCK_KEEP)
+
+| run | knob | result |
+|---|---|---|
+| gate-relay-base | off | pass: big ttft 94.4 s / short 3.1 s (references 94.6-94.7 / 3.28-3.7) |
+| gate-relay-k1 | on (v2b keeper) | HANG at the usual spot, relay verified in the binary |
+| gate-diag-k1 | on + watchdog thread | HANG; main NOT in the wait (wait returned at 63.73 s, phase 99) |
+| gate-diag2-k1 | on + caller markers + compute/keep probes | HANG; last marker `buffer get_tensor`; keep probe: launch blocks ~2 s, kernel never runs; compute probe: drained |
+| gate-diag3-k1 | on + per-thread probe + memcpy/sync markers | HANG; last marker `get_tensor: before stream sync` (memcpy returned, `cudaStreamSynchronize(cudaStreamPerThread)` spins 190+ s) |
+| gate-fix-k0 | off (keeper v3 in binary, knob off) | pass: big ttft 94.932 s / short 3.152 s (references 94.4-94.9 / 3.1-3.7) |
+| gate-fix-k1 | on (keeper v3, in-merge) | pass: big ttft 94.572 s / short 3.244 s; no new dmesg oversubscription warning (the knob-on v2b runs all logged one at the keeper's first dispatch); no sub-2000 MHz sample in the whole active window |
+| gate-fix-k2 | on (keeper v3, in-merge) | pass: big ttft 94.576 s / short 3.186 s; no hang, no new dmesg warning |
+
+Result: keeper v3 (in-merge, no extra stream) fixes the knob-on hang 2/2 at no
+ttft cost; the dmesg oversubscription warning - the v2b trigger - is gone.
+Committed as d79fd4dc9 (amended over the v2b keeper commit 13751d4c9, which was
+never pushed) on top of the relay 194197c06; branch pushed.
+
+## 2026-11-10: PR #15 thread - queue pressure is the common axis
+
+Two Nov 10 replies on PR #15 converge with the keeper root cause:
+
+- bilboquet (6800 XT, ROCm 7.14.1, SDMA fw 0x58, 2200 MHz): SDMA ON is ~2x
+  prefill (450/543 t/s vs 234/264) - SDMA off is expensive on his box; his
+  service config is SDMA on + GPU_MAX_HW_QUEUES=2, 10/10 loads clean.
+  HIP_ENABLE_DEFERRED_LOADING=0 still aborts at load (hip_platform.cpp:203).
+- Lenfleam (6700 XT gfx1031, TheRock wheels 7.13.0a, in-tree amdgpu 7.2.15):
+  HIP_ENABLE_DEFERRED_LOADING=0 aborts at load too (same rocPRIM/rocSOLVER
+  symbol error as bilboquet). GPU_MAX_HW_QUEUES=2 (SDMA on): 0 stalls in 3/3,
+  63K prompt 1089 s -> 162-175 s, no cost. Control stalls read 99 % busy at
+  ~36 W (not 0 %/5 W) and RECOVERED on their own - our hang's shape, transient.
+
+Mechanism map for the stall family (both queue/engine topology, driver side):
+1. lost dispatch / broken event link: GPU 0 %, ~5 W, libhsa spin (the original
+   PR #15 captures);
+2. descheduled runlist queues: GPU 99 % busy at elevated power (~200 W ours,
+   36 W his), host spinning in stream/event syncs on queues the runlist no
+   longer drains (our keeper hang - proven via dmesg + probes; Lenfleam's
+   control; bilboquet's 1500 MHz one-off).
+
+GPU_MAX_HW_QUEUES=2 works on three boxes: it caps the queue count so the
+runlist budget is never oversubscribed - the env-level version of keeper v3
+(no new stream, no new queue). For TheRock-wheel users the PR #15 load-time
+warning should lead with GPU_MAX_HW_QUEUES=2, since DEFERRED_LOADING=0 aborts
+at load there (rocSOLVER has no gfx103X code object in those wheels).
+Cross-post drafted: gfx1030-repro/pr15-reply-draft.md.
+
 ## Fix implications (Phase 4 re-ranked from the table)
 
 1. Kill the poller->burst step on gfx103x: (a) shorten/avoid the poller phase (overlap
@@ -160,6 +328,9 @@ frozen (2x V620 gfx1030, Strata engine, MTP drafter + verify streams).
   `HSA_ENABLE_SDMA=0`, keep `GPU_MAX_HW_QUEUES=2`.
 - `ggml_cuda_moe_hosted_wait` needs an escape or loud diagnostic: with a lost dispatch
   the event-query spin loop runs forever (reporter's single 1500 MHz hang).
+  Reproduced on the bench 2026-11-10 (6 h hang, see above). Field signature for the
+  next one: main thread R-state 100 % (mostly stime, `cudaStreamQuery` spin), serving
+  thread in `kfd_wait_on_events`, GPU flat ~200 W / 99 % with no log output.
 - Candidate 1 (kill the poller->burst step) must not cost short-prefill speed: bench gate
   = the 13 W/499 MHz -> 196 W/2540 MHz step attenuates and t/s is unchanged (the reporter
   keeps the clock cap because MAX_ROWS=256 costs short prefill 180->75 t/s).
