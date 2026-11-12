@@ -11480,6 +11480,9 @@ static void moe_cache_ring_zone(void * opaque, void * backend, void * base, size
     if (!device) {
         return;
     }
+    if (!base && !device->ring) {
+        return;   // clearing a ring that was never set up: nothing to do (and no stream/HW queue to create)
+    }
     ggml_cuda_set_device(device->logical);
     if (!device->ring) {
         device->ring = new moe_ring_state();
